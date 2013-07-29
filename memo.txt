@@ -1,0 +1,128 @@
+1. Digit recognition
+   http://my-tech-talk.blogspot.com/2012/06/digit-recognition-with-opencv.html
+   http://stackoverflow.com/questions/9413216/simple-digit-recognition-ocr-in-opencv-python
+
+
+
+//    cv::Mat src_img;
+
+
+    cv::Mat prevImg, curImg;
+    cv::Mat flow;
+    std::vector<cv::KeyPoint> prevFeatures, curFeatures;
+    std::vector<cv::Point2f> prevPoints, curPoints;
+    std::vector<uchar> status;
+    std::vector<float> err;
+    cv::Mat fore;
+    cv::Mat back;
+    std::vector<std::vector<cv::Point> > contours;
+
+    cv::GFTTDetector gfttd(500, 0.01, 1);
+    cv::BackgroundSubtractorMOG2 bg(50, 9, true);
+
+//    cv::VideoCapture capture;
+//    capture.set(CV_CAP_PROP_FRAME_WIDTH, 640);
+//    capture.set(CV_CAP_PROP_FRAME_HEIGHT, 480);
+//    capture.open("./Front_Door.mp4");
+
+//    cv::Mat mono_img;
+//    cv::HOGDescriptor hog;
+//    hog.setSVMDetector(cv::HOGDescriptor::getDefaultPeopleDetector());
+
+//    unsigned char lut[256];
+//    for (int i=0; i<256; ++i)
+//    {
+//        lut[i] = std::pow((float)(i/255.0), 0.55) * 255.0;
+//    }
+
+//   std::vector<cv::Rect> found;
+//   cv::Rect roi = cv::Rect(0, 0, 570, 430);
+//    while(true) {
+//        capture >> src_img;
+//        cv::cvtColor(src_img, mono_img, CV_BGR2GRAY);
+//        cv::Mat roiSrcImg = mono_img(roi);
+//        //cv::equalizeHist(roiSrcImg, roiSrcImg);
+//        cv::MatIterator_<uchar> it, end;
+//        for (it=roiSrcImg.begin<uchar>(), end=roiSrcImg.end<uchar>(); it!=end; it++)
+//        {
+//            *it = lut[(*it)];
+//        }
+
+//        hog.detectMultiScale(roiSrcImg, found);
+
+//        for(unsigned i = 0; i < found.size(); i++) {
+//            cv::Rect r = found[i];
+//            cv::rectangle(roiSrcImg, r.tl(), r.br(), cv::Scalar(0,255,0), 2);
+//        }
+
+//        cv::rectangle(mono_img, roi, cv::Scalar(0, 255, 0), 3);
+
+//        imshow("After Equalization", roiSrcImg);
+//        cv::Mat tmp;
+//        cv::cvtColor(src_img, tmp, CV_BGR2GRAY);
+//        imshow("Before Equalization", tmp);
+
+//        if( (char)cv::waitKey(1) == 27) break;
+//    }
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+
+    while (true) {
+        cap >> frame;
+        //int frameNum = cap.get(CV_CAP_PROP_POS_FRAMES);
+        if (frame.empty()) {
+             break;
+        };
+
+        if(frame.channels()>1){
+            cv::cvtColor(frame, curImg, CV_RGB2GRAY);
+        } else {
+            curImg = frame;
+        }
+
+       cv::Mat roiSrcImg = curImg(roi);
+
+
+        cv::MatIterator_<uchar> it, end;
+        for (it=roiSrcImg.begin<uchar>(), end=roiSrcImg.end<uchar>(); it!=end; it++)
+        {
+            //std::cout << (int)*it << " ";
+            *it = lut[(*it)];
+            //std::cout << (int)*it << std::endl;
+        }
+
+        if (!prevImg.empty()) {
+            cv::calcOpticalFlowFarneback(prevImg, roiSrcImg, flow, 0.5, 3, 20, 3, 5, 1.5, 0);
+            cv::Mat cflowmap = frame.clone();
+            drawOptFlowMap(flow, cflowmap, 0, 0, cv::Scalar(0, 0, 255));
+            cv::imshow("Video", cflowmap);
+        }
+
+        if ((char)cv::waitKey(30) == 27) {
+           break;
+        }
+
+        roiSrcImg.copyTo(prevImg);
+        std::swap(curPoints, prevPoints);
+    }
+
+////////////////////////////////////////////////////////////////////
+bg.operator ()(curImg, fore);
+bg.getBackgroundImage(back);
+cv::erode(fore,fore,cv::Mat());
+cv::dilate(fore,fore,cv::Mat());
+cv::findContours(fore,contours,CV_RETR_EXTERNAL,CV_CHAIN_APPROX_NONE);
+cv::drawContours(frame,contours,-1,cv::Scalar(0,0,255),2);
+cv::imshow("Frame",frame);
+cv::imshow("Background",back);
+if(cv::waitKey(3) >= 0) break;
+
+/////////////////////////////////////////////////////////////////////
+//        // gamma correction
+//        cv::MatIterator_<uchar> it, end;
+//        for (it=curImg.begin<uchar>(), end=curImg.end<uchar>(); it!=end; it++)
+//        {
+//            *it = lut[(*it)];
+//        }
+
+//        cv::threshold(curImg, bin, 75, 255, cv::THRESH_BINARY);
