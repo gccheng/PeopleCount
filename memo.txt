@@ -3,6 +3,13 @@
    http://stackoverflow.com/questions/9413216/simple-digit-recognition-ocr-in-opencv-python
 
 
+                            std::vector<cv::Point2f>::iterator iit = iTrack->begin();
+                            while (iit!=iTrack->end()) {
+                                std::cout << iit->x << " " << iit->y << " ";
+                                ++iit;
+                            }
+                            std::cout << std::endl;
+
 
 //    cv::Mat src_img;
 

@@ -13,13 +13,14 @@ class DigitRecognizer
 {
 public:
     DigitRecognizer(int ts = 1, int cl = 10, int sx = 20, int sy = 30, std::string path = "./images");
+    ~DigitRecognizer();
 
 public:
     void learnFromImages();
     void runSelfTest();
-    void analyseImage(std::string strImage);
-    void analyseImage(cv::Mat& image);
-    void analyseLocationImage(cv::Mat& image);
+    std::string analyseImage(std::string strImage, bool showWindow = true);
+    std::string analyseImage(cv::Mat& image, bool showWindow = true);
+    std::string analyseLocationImage(cv::Mat& image, bool showWindow = true);
     void setClassifier();
     int test();
 

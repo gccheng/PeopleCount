@@ -1,0 +1,853 @@
+
+#define PRIVATE
+#define CALLBACK
+#define UNKNOWN_FLOW_THRESH 1e9
+
+// Optical Flow Region
+#define OF_X 356
+#define OF_Y 100
+#define OF_WIDTH 90
+#define OF_HEIGHT 200
+// ROI Region
+#define ROI_X 403
+#define ROI_Y 233
+#define ROI_WIDTH 46
+#define ROI_HEIGHT 69
+
+// Time & Track  3, 24
+int t_min = 3;                  // if two trajectories are less than t_min apart, their distance is 0
+int t_max = 30;                 // if two trajectories are more than t_max apart, their distance is 1
+int baseline_orient = 27;       // the orientation (in degrees) of the tripwire
+int track_len = 12;             // minimum length of a valid trajectory
+float t_threshold = 0.6;        // threshold for for trajectories between (t_min, t_max)
+// Board 20  Alight 50
+int min_track_group_off = 45;   // minimum number of trajectories for each alighting passenger
+int min_track_group_on = 45;    // minimum number of trajectories for each boarding passenger
+// Tripwire -30 -20
+int voffset = -20;              // vertical offset of the tripwire
+int hoffset = -10;              // horizontal offset of the tripwire
+
+int trackvalue = 5;             // position of track  bar
+unsigned char lut[256];         // gamma function
+float speedratio = trackvalue>=5 ? trackvalue-4 : 1.0/(6-trackvalue);   // play speed
+
+// Optical Flow + HOG
+void drawOptFlowMap(const cv::Mat& flow, cv::Mat& cflowmap, int step, double scale, const cv::Scalar& color);
+void drawOptFlowMap2(const cv::Mat& flow, cv::Mat& cflowmap, int step, double scale, const cv::Scalar& color);
+int countPassengers(std::string file);
+
+// Perspective Change
+int orthPerspective(std::string file);
+
+// Gaussian Mixtures
+int subtractBG(std::string file);
+
+//Feature Point + Start Time
+PRIVATE std::vector<cv::Point2f> lastPoints(std::list<std::vector<cv::Point2f> >& tracks);
+PRIVATE void addPoints(std::list<std::vector<cv::Point2f> >& tracks, std::vector<cv::Point2f> points, float frame);
+PRIVATE void drawtrajectory(std::vector<cv::Point2f>& track, cv::Mat& image);
+PRIVATE bool isValidTrack(const std::vector<cv::Point2f>& track, float& mean_x, float& mean_y, float& var_x, float& var_y, float& length);
+PRIVATE int updateModel(std::vector<std::list<int> >& models, const std::vector<cv::Point2f>& track, int onOrOff);
+PRIVATE int onOroff(const std::vector<cv::Point2f>& track);
+PRIVATE int onOrOffStartEnd(const std::vector<cv::Point2f>& track);
+PRIVATE int onOrOffHistOrient(const std::vector<cv::Point2f>& track);
+PRIVATE int getMajorityDirection(const std::list<std::vector<cv::Point2f> >& trajectories, int time);
+PRIVATE void getStartTimes(const std::list<std::vector<cv::Point2f> >& trajectories, std::vector<int>& startTimes, int fno);
+PRIVATE void gammaCorrection(cv::Mat& image);
+int trackClassify(std::string file);
+
+    //trackClassify("../PeopleCount/Rear_Door.mp4");
+    //trackClassify("../PeopleCount/Front_Door.mp4");
+    //countPassengers("./Front_Door.mp4");
+    //orthPerspective("./Front_Door.mp4");
+    //subtractBG("./Front_Door.mp4");
+
+
+int trackClassify(std::string file)
+{
+    cv::VideoCapture cap(file.c_str());
+    if (!cap.isOpened()) {
+        std::cout << "Could not open file" << std::endl;
+        return 1;
+    }
+    //int frate = 1000/cap.get(CV_CAP_PROP_FPS);
+    int frate = 30;
+    int dumy = 17178;  // @debug
+
+    // Location recognition
+    //DigitRecognizer dr(1,10,8,9);
+    //dr.learnFromImages();
+    //dr.setClassifier();
+
+    // find perspective transformation
+    cv::Point2f src[4], dst[4];
+    src[0] = cv::Point2f(277, 217);
+    src[1] = cv::Point2f(372, 168);
+    src[2] = cv::Point2f(396, 210);
+    src[3] = cv::Point2f(289, 262);
+    dst[0] = cv::Point2f(277-100, 217-100);
+    dst[1] = cv::Point2f(372-100, 217-100);
+    dst[2] = cv::Point2f(372-100, 200-100);
+    dst[3] = cv::Point2f(277-100, 200-100);
+    cv::Mat M = cv::getPerspectiveTransform(src, dst);
+
+    // define tripwire
+    // front door
+    cv::Point2f start = cv::Point2f(252+hoffset, 217+voffset);
+    cv::Point2f end = cv::Point2f(377+hoffset, 153+voffset);
+    // orthogonal
+//    cv::Point2f start = cv::Point2f(170+hoffset, 122+voffset);
+//    cv::Point2f end = cv::Point2f(270+hoffset, 122+voffset);
+    // rear door
+//    cv::Point2f start = cv::Point2f(96+hoffset, 336+voffset);
+//    cv::Point2f end = cv::Point2f(207+hoffset, 289+voffset);
+    baseline_orient = cv::fastAtan2(start.y-end.y, end.x-start.x);
+
+    std::vector<cv::Point2f> tripWire;
+    std::list<std::vector<cv::Point2f> > trajectories; // a list of trajectories
+    std::vector<std::list<int> > on_models; // each model is a list of start times
+    std::vector<std::list<int> > off_models;
+    float mean_x=0.0f, mean_y=0.0f;
+    float var_x=0.0f, var_y=0.0f;
+    float length=0.0f;
+
+    float slope = (float)(end.y-start.y)/(end.x-start.x);
+    int shrink = 20;
+    for (float x=start.x+shrink, inc=1.0f; x<end.x-shrink; x+=0.5, inc+=0.5) {
+        cv::Point2f pt(x, start.y+(inc+shrink)*slope);
+        tripWire.push_back(pt);
+
+        cv::Point2f time(0, 0);
+        cv::vector<cv::Point2f> vec;
+        vec.push_back(time);
+        vec.push_back(pt);
+        trajectories.push_back(vec);
+    }
+
+    cv::Mat capframe, frame, image, gray, prevGray, location;
+    cv::Mat showImage;
+    cv::Mat flow; // optical flow
+    cv::Size winSize(31,31);
+    cv::TermCriteria termcrit(CV_TERMCRIT_ITER|CV_TERMCRIT_EPS, 20, 0.03);
+    int onPassengers = 0;
+    int offPassengers = 0;
+    int missPassengers = 0;
+    while (true) {
+        int fno = cap.get(CV_CAP_PROP_POS_FRAMES);
+        if (fno>=dumy) {
+            int a = 1;
+        }
+
+        cap >> capframe;
+        if (capframe.empty()) break;
+
+        frame = capframe(cv::Rect(0,0,580,450));//frame(cv::Rect(240,80,200, 240));
+        frame.copyTo(showImage);
+        //cv::warpPerspective(frame, frame, M, frame.size() );
+        //location = capframe(cv::Rect(810, 90, 90, 30));
+        //dr.analyseLocationImage(location);
+
+        frame.copyTo(image);
+        cv::cvtColor(image, gray, CV_BGR2GRAY);
+        //gammaCorrection(gray);
+
+        if (prevGray.empty()) {
+            gray.copyTo(prevGray);
+        }
+
+        // add points to trajectories
+        if(trajectories.size()<160) { //70 160
+            addPoints(trajectories, tripWire, fno);
+        }
+
+        std::vector<uchar> status;
+        std::vector<float> err;
+        std::vector<cv::Point2f> nextPoints;
+        std::vector<cv::Point2f> prevPoints = lastPoints(trajectories);
+        cv::calcOpticalFlowPyrLK(prevGray, gray, prevPoints, nextPoints, status, err, winSize, 3, termcrit, 0, 0.001);
+
+        //cv::calcOpticalFlowFarneback(prevGray, gray, flow, 0.5, 3, 20, 3, 5, 1.5, 0);
+        //drawOptFlowMap2(flow, image, 0, 0, cv::Scalar(0, 0, 255));
+
+        int i=0;
+        std::list<std::vector<cv::Point2f> >::iterator iTrack = trajectories.begin();
+        for (; iTrack!=trajectories.end(); i++) {
+            int szTrack = iTrack->size();
+            isValidTrack(*iTrack, mean_x, mean_y, var_x, var_y, length);
+
+            if ((szTrack>3) && (var_x<1.0f) && (var_y<1.0f)) { // stationary points
+                iTrack = trajectories.erase(iTrack);
+            } else if ((!status[i] || err[i]>13.0) && (szTrack>10)) { // lost of tracking
+                iTrack->at(0).y = 1.0;
+                iTrack++;
+            } else if (szTrack>120) { // too long, remove  180
+                iTrack = trajectories.erase(iTrack);
+            } else if (szTrack>80) { // long trajectory, try to check 120
+                iTrack->at(0).y = 2.0;
+                iTrack->push_back(nextPoints[i]);
+                iTrack++;
+            } else {
+                iTrack->push_back(nextPoints[i]);
+                iTrack++;
+            }
+        }
+
+        // update models according to the direction of trajectories
+        std::vector<int> startTimes;
+        getStartTimes(trajectories, startTimes, fno);
+        std::vector<int>::iterator iTime = startTimes.begin();
+        for (; iTime!=startTimes.end(); iTime++) {
+            int overall_direction = getMajorityDirection(trajectories, *iTime);
+            for (i=0, iTrack=trajectories.begin(); iTrack!=trajectories.end(); i++) {
+                drawtrajectory(*iTrack, image);
+                if (((int)(iTrack->at(0).x) == *iTime) && (iTrack->at(0).y>0.0f)) { // only use trajectories long enough
+                    bool validTrack = isValidTrack(*iTrack, mean_x, mean_y, var_x, var_y, length);
+                    int onoff = onOroff(*iTrack);
+                    if (validTrack && (onoff==overall_direction)) {
+                        //finalTrajectories.push_back(*iTrack);
+                        switch(onoff) {
+                            case 0: offPassengers = updateModel(off_models, *iTrack, onoff);
+                                    iTrack = trajectories.erase(iTrack);
+                                    continue;
+                            case 1: onPassengers = updateModel(on_models, *iTrack, onoff);
+                                    iTrack = trajectories.erase(iTrack);
+                                    continue;
+                            case 2: missPassengers++;
+                                    iTrack = trajectories.erase(iTrack);
+                                    continue;
+                            default: std::cout << "Error: Wrong branch!" << std::endl;
+                        }
+                    }
+                    if ((int)(iTrack->at(0).y) == 1) { // lost tracking
+                        iTrack = trajectories.erase(iTrack);
+                    }
+                }
+
+                iTrack++;
+            }
+        }
+
+        std::ostringstream oss;
+        oss << "BOARD: " << onPassengers;
+        cv::putText(image, oss.str(), cv::Point(20,40), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0));
+        oss.str("");
+        oss << "ALIGHT: " << offPassengers;
+        cv::putText(image, oss.str(), cv::Point(20,70), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0));
+
+        cv::imshow("Passenger Count", image);
+
+
+
+        if ((char)cv::waitKey(frate/speedratio)==27) break;
+
+        cv::swap(prevGray, gray);
+    }
+
+    return 0;
+}
+
+struct RetrieveKey {
+    int operator()(const std::pair<int,int>& keyValuePair) const {
+        return keyValuePair.first;
+    }
+};
+
+void getStartTimes(const std::list<std::vector<cv::Point2f> >& trajectories, std::vector<int>& startTimes, int fno)
+{
+    std::map<int, int> startMap;
+    std::list<std::vector<cv::Point2f> >::const_iterator iTrack = trajectories.begin();
+    for (; iTrack!=trajectories.end(); iTrack++) {
+        if (fno-iTrack->size()>track_len) {
+            startMap[iTrack->at(0).x]++;
+        }
+    }
+
+    std::transform(startMap.begin(), startMap.end(), std::back_inserter(startTimes), RetrieveKey());
+}
+
+PRIVATE void gammaCorrection(cv::Mat& image)
+{
+    cv::MatIterator_<uchar> it, end;
+    for (it=image.begin<uchar>(), end=image.end<uchar>(); it!=end; it++)
+    {
+        *it = lut[(*it)];
+    }
+}
+
+
+PRIVATE std::vector<cv::Point2f> lastPoints(std::list<std::vector<cv::Point2f> >& tracks)
+{
+    std::vector<cv::Point2f> points;
+    std::list<std::vector<cv::Point2f> >::iterator it = tracks.begin();
+    for (; it!=tracks.end(); ++it)
+    {
+        points.push_back(it->back());
+    }
+
+    return points;
+}
+
+PRIVATE void addPoints(std::list<std::vector<cv::Point2f> >& tracks, std::vector<cv::Point2f> points, float frame)
+{
+    std::vector<cv::Point2f>::iterator it= points.begin();
+    for (; it!=points.end(); it++)
+    {
+        std::vector<cv::Point2f> vec;
+        vec.push_back(cv::Point2f(frame, 0));
+        vec.push_back(*it);
+        tracks.push_back(vec);
+    }
+}
+
+// draw trajectory {desc}, which is in {level}th pyramid, in {image}
+PRIVATE void drawtrajectory(std::vector<cv::Point2f>& track, cv::Mat& image)
+{
+    std::vector<cv::Point2f>::iterator it = track.begin();
+    float length = track.size();
+    it++;  // skip time element at the beginning
+    cv::Point2f point0 = *it;
+
+    float j = 0;
+    for(it++; it!=track.end() ; ++it, ++j)
+    {
+        cv::Point2f point1(*it);
+
+        cv::line(image, point0, point1, cv::Scalar(0, cv::saturate_cast<uchar>(255.0*(j+1.0)/length), 0), 2, 8, 0);
+        point0 = point1;
+    }
+    cv::circle(image, point0, 1, cv::Scalar(255, 0, 0), -1, 8, 0);
+}
+
+// check if a track is valid
+PRIVATE bool isValidTrack(const std::vector<cv::Point2f>& track, float& mean_x, float& mean_y, float& var_x, float& var_y, float& length)
+{
+    mean_x = mean_y = var_x = var_y = length = 0.0f;
+
+    int size = track.size();
+    for(int i = 1; i < size; i++) {
+        mean_x += track[i].x;
+        mean_y += track[i].y;
+    }
+    mean_x /= size-1;
+    mean_y /= size-1;
+
+    for(int i = 1; i < size; i++) {
+        var_x += (track[i].x-mean_x)*(track[i].x-mean_x);
+        var_y += (track[i].y-mean_y)*(track[i].y-mean_y);
+    }
+    var_x /= size-1;
+    var_y /= size-1;
+    var_x = sqrt(var_x);
+    var_y = sqrt(var_y);
+    // remove static trajectory
+    if(var_x < 5 && var_y < 5)
+        return false;
+    // remove random trajectory
+    if( var_x > 100 || var_y > 100 )
+        return false;
+
+    for(int i = 2; i < size; i++) {
+        float temp_x = track[i].x - track[i-1].x;
+        float temp_y = track[i].y - track[i-1].y;
+        length += sqrt(temp_x*temp_x+temp_y*temp_y);
+    }
+    // remove too short trajectory
+    if(length<40) { //70
+        return false;
+    }
+
+    // check the uniformality of the trajectory
+    float len_thre = length*0.4;
+    int nValidSeg = 0;
+    std::vector<float> hod(4, 0);  // histogram of segment directions
+    for( int i = 2; i < size; i++ ) {
+        float temp_x = track[i].x - track[i-1].x;
+        float temp_y = track[i].y - track[i-1].y;
+        float temp_dist = sqrt(temp_x*temp_x + temp_y*temp_y);
+        if( temp_dist > len_thre )
+            return false;
+
+        if (temp_dist < 0.1) {
+            //hod[8]++;
+        } else {
+            int degree = (int)cv::fastAtan2(temp_y, temp_x);
+            hod[degree/90]++;
+            nValidSeg++;
+        }
+    }
+
+    // check the straightness of the trajectory
+    std::transform(hod.begin(), hod.end(), hod.begin(), std::bind2nd(std::divides<float>(), nValidSeg));
+    float entropy = 0.0f;
+    for (std::vector<float>::iterator it=hod.begin(); it!=hod.end(); it++) {
+        if (std::fabs(*it) < 1e-4) {
+            entropy += 0;
+        } else {
+            entropy += (*it) * std::log10(*it);
+        }
+    }
+    entropy *= -1.0f;
+    //if (entropy > 0.45) {
+    //    return false;
+    //}
+
+    float directLen = cv::norm(track[1]-track[size-1]);
+    if (directLen/length < 0.3) {
+        ///std::cout << "directLen/length < 0.3: " << track << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+PRIVATE int onOrOffStartEnd(const std::vector<cv::Point2f>& track)
+{
+    std::vector<cv::Point2f>::const_iterator iSeg = track.begin();
+    iSeg++;  // skip the time element
+    cv::Point2f point0 = *iSeg;
+    cv::Point2f point1 = track[track.size()-1];
+    float orient = cv::fastAtan2(-(point1.y-point0.y), point1.x-point0.x); // -because opencv uses different xoy coordinate
+    if (orient>30+baseline_orient && orient<170+baseline_orient) {//150
+        return 0;
+    } else if (orient>200+baseline_orient && orient<315+baseline_orient) {
+        return 1;
+    } else{
+        return 2;
+    }
+}
+
+PRIVATE int onOrOffHistOrient(const std::vector<cv::Point2f>& track)
+{
+    std::vector<float> orient_hist(3,0);
+    std::vector<cv::Point2f>::const_iterator iSeg = track.begin();
+    iSeg++;  // skip the time element
+    cv::Point2f point0 = *iSeg;
+    for (++iSeg; iSeg!= track.end(); iSeg++)
+    {
+        cv::Point2f point1 = *iSeg;
+        float orient = cv::fastAtan2(-(point1.y-point0.y), point1.x-point0.x); // -because opencv uses different xoy coordinate
+        float dist = cv::norm(point1-point0);
+        if (orient>45+baseline_orient && orient<170+baseline_orient) {
+            orient_hist[0] += dist;
+        } else if (orient>210+baseline_orient && orient<315+baseline_orient) {
+            orient_hist[1] += dist;
+        } else if (orient < baseline_orient*0.8) {
+            orient_hist[1] += dist;
+        } else{
+            orient_hist[2] += dist;
+        }
+        point0 = point1;
+    }
+
+    std::vector<float>::iterator iMax = std::max_element(orient_hist.begin(), orient_hist.end());
+    return (int)std::distance(orient_hist.begin(), iMax);
+}
+
+// Get on (1)/off(0), 2 otherwise
+PRIVATE int onOroff(const std::vector<cv::Point2f>& track)
+{
+    //return onOrOffHistOrient(track);
+    return onOrOffStartEnd(track);
+}
+
+// Get the majority on/off according to the the tracking points
+PRIVATE int getMajorityDirection(const std::list<std::vector<cv::Point2f> >& trajectories, int time)
+{
+    std::vector<int> orient_hist(3,0);
+    float mean_x=0.0f, mean_y=0.0f;
+    float var_x=0.0f, var_y=0.0f;
+    float length=0.0f;
+    std::list<std::vector<cv::Point2f> >::const_iterator iTrack = trajectories.begin();
+    for (; iTrack!=trajectories.end(); ++iTrack) {
+        if ((iTrack->at(0).x==time) && isValidTrack(*iTrack, mean_x, mean_y, var_x, var_y, length)) {
+            int onoff = onOroff(*iTrack);
+            orient_hist[onoff]++;
+        }
+    }
+
+    std::vector<int>::iterator iMax = std::max_element(orient_hist.begin(), orient_hist.end());
+    if (*iMax==0) return 2;
+    else return (int)std::distance(orient_hist.begin(), iMax);
+}
+
+
+PRIVATE int updateModel(std::vector<std::list<int> >& models, const std::vector<cv::Point2f> &track, int onOrOff)
+{
+
+    float d_min = 1.1f;
+    std::vector<std::list<int> >::iterator it_min;
+
+    int start = track[0].x;   // start time of the track
+    int MIN_TRACK_GROUP = (onOrOff==0 ? min_track_group_off : min_track_group_on);
+
+    std::vector<std::list<int> >::iterator iModel = models.begin();
+    for (; iModel!=models.end(); iModel++) {
+        float ds = 1.0f;   // min distance to this model
+        std::vector<float> vecds;
+        std::list<int>::iterator iTrack = iModel->begin();
+        for (; iTrack!=iModel->end(); iTrack++) {
+            int iStart = *iTrack;
+            float ds_track = 1.0f;   // min distance to a track in this group
+            if (fabs(start-iStart) < t_min) {
+                ds_track = 0.0;
+            }
+            else if (fabs(start-iStart) > t_max) {
+                ds_track = 1.0;
+            }
+            else {
+                ds_track = (fabs(start-iStart)-t_min)/(t_max-t_min);
+            }
+
+            vecds.push_back(ds_track);
+        }
+
+        std::sort(vecds.begin(), vecds.end());
+        ds = vecds.at(vecds.size()/2);
+
+        if (ds <= d_min) {
+            d_min = ds;
+            it_min = iModel;
+        }
+
+    }
+
+    if (d_min < t_threshold) {
+        it_min->push_back(start);
+    }
+    else {
+        std::list<int> ls(1, start);
+        models.push_back(ls);
+    }
+
+    //return models.size();
+    int passengers = 0;
+    iModel = models.begin();
+    for (; iModel!=models.end(); iModel++)
+    {
+        if (iModel->size()>=MIN_TRACK_GROUP)
+        {
+            passengers++;
+        }
+    }
+
+    return passengers;
+
+}
+
+void drawOptFlowMap2(const cv::Mat& flow, cv::Mat& cflowmap, int step, double scale, const cv::Scalar& color)
+{
+    cv::Mat overlay = cflowmap.clone();
+    int width = flow.cols;
+    int height = flow.rows;
+    for (int y=0; y<height/2; y++) {
+        for (int x=0; x<width/2; x++) {
+            cv::Vec2f flow_at_point = flow.at<cv::Vec2f>(y,x);
+            float fx = flow_at_point[0];
+            float fy = flow_at_point[1];
+
+            if (std::sqrt(fx*fx+fy*fy)>1.) {
+                if ((fabs(fx) >  UNKNOWN_FLOW_THRESH) || (fabs(fy) >  UNKNOWN_FLOW_THRESH))
+                    continue;
+                float deg = cv::fastAtan2(fy, fx);
+                deg -= 30;
+                cv::Scalar color;
+                if (deg<45 || deg>315) {
+                    color = cv::Scalar(255, 0, 0);
+                    cv::circle(overlay, cv::Point(x,y), 1, color, 1, 8, 0);
+                } else if (deg>=135 && deg<=215) {
+                    color = cv::Scalar(0, 255, 0);
+                    cv::circle(overlay, cv::Point(x,y), 1, color, 1, 8, 0);
+                } else {
+                    color = cv::Scalar(0, 0, 255);
+                    cv::circle(overlay, cv::Point(x,y), 1, color, 1, 8, 0);
+                }
+            }
+        }
+    }
+
+    cv::addWeighted(cflowmap, 0.6, overlay, 0.4, 0, cflowmap);
+}
+
+void drawOptFlowMap(const cv::Mat& flow, cv::Mat& cflowmap, int step, double scale, const cv::Scalar& color)
+{
+    cv::Mat overlay = cflowmap.clone();
+    int width = flow.cols;
+    int height = flow.rows;
+    for (int y=0; y<height; y++) {
+        for (int x=0; x<width; x++) {
+            cv::Vec2f flow_at_point = flow.at<cv::Vec2f>(y,x);
+            float fx = flow_at_point[0];
+            float fy = flow_at_point[1];
+
+            if (std::sqrt(fx*fx+fy*fy)>1.0) {
+                if ((fabs(fx) >  UNKNOWN_FLOW_THRESH) || (fabs(fy) >  UNKNOWN_FLOW_THRESH))
+                    continue;
+                float deg = cv::fastAtan2(fy, fx);
+                cv::Scalar color;
+                // Getting ON or OFF
+                if (deg<45 || deg>270) {
+                    color = cv::Scalar(255, 0, 0);
+                    cv::circle(overlay, cv::Point(OF_X+x,OF_Y+y), 1, color, 1, 8, 0);
+                } else if (deg>=45 && deg<=135) {
+                    color = cv::Scalar(0, 255, 0);
+                    cv::circle(overlay, cv::Point(OF_X+x,OF_Y+y), 1, color, 1, 8, 0);
+                }
+                //else if (deg>135 && deg<225) color = cv::Scalar(0, 255, 0);
+                //else color = cv::Scalar(255, 0, 0);
+            }
+        }
+    }
+    cv::rectangle(overlay, cv::Point(OF_X, OF_Y), cv::Point(OF_X+OF_WIDTH, OF_Y+OF_HEIGHT), cv::Scalar(0, 255, 0), 2, 8, 0);
+
+    cv::addWeighted(cflowmap, 0.6, overlay, 0.4, 0, cflowmap);
+}
+
+int countPassengers(std::string file) {
+
+    cv::VideoCapture cap(file.c_str());
+    if (!cap.isOpened()) {
+        std::cout << "Could not open file" << std::endl;
+        return 1;
+    }
+
+    int frate = 1000/cap.get(CV_CAP_PROP_FPS);
+
+    cv::Mat frame, curImg, tripWire, doorRegion, ofRegion;
+    cap >> frame;
+
+    cv::Mat prevImg, flow;
+    std::vector<cv::KeyPoint> prevFeatures, curFeatures;
+
+    //cv::Rect roi = cv::Rect(403, 243, 46, 59);
+    cv::Rect roi = cv::Rect(ROI_X, ROI_Y, ROI_WIDTH, ROI_HEIGHT);
+    cv::Rect rectOf = cv::Rect(OF_X, OF_Y, OF_WIDTH, OF_HEIGHT);
+    cv::Rect rectDoor = cv::Rect(148, 0, 212, 180);
+    double minVal, maxVal;
+    cv::Point minIndex, maxIndex;
+
+    cv::FileStorage ofs("hog.xml", cv::FileStorage::WRITE);
+    ofs << "HOG" << "{";
+
+    while (true) {
+        cap >> frame;
+        if (frame.empty()) break;
+
+        if(frame.channels()>1) {
+            cv::cvtColor(frame, curImg, CV_RGB2GRAY);
+        }
+        else {
+            curImg = frame;
+        }
+
+        tripWire = curImg(roi);
+        doorRegion = curImg(rectDoor);
+        ofRegion = curImg(rectOf).clone();
+
+        if (!prevImg.empty())
+        {
+            cv::calcOpticalFlowFarneback(prevImg, ofRegion, flow, 0.5, 3, 20, 3, 5, 1.5, 0);
+            cv::Mat tmp = frame.clone();
+            drawOptFlowMap(flow, tmp, 0, 0, cv::Scalar(0, 0, 255));
+            cv::rectangle(tmp, cv::Rect(ROI_X, ROI_Y, ROI_WIDTH, ROI_HEIGHT), cv::Scalar(0, 0, 255), 1, 8, 0);
+
+            cv::Mat hist2 = HofComp(flow);
+
+            // HOF
+            cv::minMaxLoc(hist2, &minVal, &maxVal);
+            cv::Mat canvas2 = cv::Mat::ones(255, 90+30+100, CV_8UC3);
+            for (int j=0; j<9; j++)
+            {
+                cv::rectangle(canvas2,
+                              cv::Point(j*10, 255), cv::Point(j*10+10, 255-(int)(hist2.at<float>(j)*255/maxVal)),
+                              cv::Scalar(0, 0, 255), 1, 8, 0);
+            }
+            cv::putText(canvas2, "HoF", cv::Point(30, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar::all(255), 1, 8, false);
+            cv::line(canvas2, cv::Point(90+20, 255), cv::Point(110, 0), cv::Scalar(0, 255, 0), 2, 8, 0);
+
+            // Direction
+            cv::Mat hist3 = cv::Mat::zeros(1, 3, CV_32FC1);
+            hist3.at<float>(0) = hist2.at<float>(0) + hist2.at<float>(6) + hist2.at<float>(7);
+            hist3.at<float>(1) = hist2.at<float>(2) + hist2.at<float>(3) + hist2.at<float>(4);
+            hist3.at<float>(2) = hist2.at<float>(8);
+            //std::cout << hist3.at<float>(0) << " " << hist3.at<float>(1) << " " << hist3.at<float>(2) << std::endl;
+            cv::minMaxLoc(hist3, &minVal, &maxVal, &minIndex, &maxIndex);
+            //cv::Mat canvas3 = cv::Mat::ones(255, 120, CV_8UC3);
+            for (int j=0; j<3; j++)
+            {
+                cv::rectangle(canvas2,
+                              cv::Point(90+30+60+j*10, 255), cv::Point(90+30+60+j*10+10, 255-(int)(hist3.at<float>(j)*255/maxVal)),
+                              cv::Scalar(0, 0, 255), 1, 8, 0);
+            }
+            if (maxIndex==cv::Point(0,0) || (hist3.at<float>(0) > hist3.at<float>(1) && hist3.at<float>(2)<OF_WIDTH*OF_HEIGHT/1.25))
+            {
+                cv::putText(canvas2, "ON", cv::Point(90+30, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,0,0), 1, 8, false);
+            }
+            else if(maxIndex==cv::Point(1,0) || (hist3.at<float>(0) < hist3.at<float>(1) && hist3.at<float>(2)<OF_WIDTH*OF_HEIGHT/1.25))
+            {
+                cv::putText(canvas2, "OFF", cv::Point(90+30, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1, 8, false);
+            }
+            else
+            {
+                cv::putText(canvas2, "", cv::Point(90+30, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar::all(255), 1, 8, false);
+            }
+            cv::imshow("Direction", canvas2);
+
+            cv::imshow("OpticalFlowOverlapped", tmp);
+        }
+        ofRegion.copyTo(prevImg);
+
+        // gamma correction
+        cv::MatIterator_<uchar> it, end;
+        for (it=tripWire.begin<uchar>(), end=tripWire.end<uchar>(); it!=end; it++)
+        {
+            *it = lut[(*it)];
+        }
+
+        //HoG for the observed region
+        cv::Mat hist = HogComp(tripWire);
+        cv::minMaxLoc(hist, &minVal, &maxVal);
+
+        std::ostringstream oss(std::ios_base::out | std::ios_base::ate);
+        oss << "frame" << cap.get(CV_CAP_PROP_POS_FRAMES)-1;
+        ofs << oss.str() << "[";
+        cv::Mat canvas = cv::Mat::ones(255, 80, CV_8UC3);
+        for (int j=0; j<8; j++)
+        {
+            cv::rectangle(canvas,
+                          cv::Point(j*10, 255), cv::Point(j*10+10, 255-(int)(hist.at<float>(j)*255/maxVal)),
+                          cv::Scalar(0, 0, 255), 1, 8, 0);
+            ofs << hist.at<float>(j);
+        }
+        ofs << "]";
+        cv::imshow("ROI HoG", canvas);
+
+        if ((char)cv::waitKey(frate/speedratio)==27) break;
+    }
+
+    ofs << "}";
+    ofs.release();
+
+    cv::destroyAllWindows();
+    cap.release();
+    return 0;
+}
+
+int orthPerspective(std::string file)
+{
+    cv::VideoCapture cap(file.c_str());
+    if (!cap.isOpened())
+    {
+        std::cout << "Could not open file" << std::endl;
+        return 1;
+    }
+
+    // find perspective transformation
+    cv::Point2f src[4], dst[4];
+    src[0] = cv::Point2f(257, 60);
+    src[1] = cv::Point2f(303, 35);
+    src[2] = cv::Point2f(365, 149);
+    src[3] = cv::Point2f(327, 165);
+    dst[0] = cv::Point2f(257+80, 60-20);
+    dst[1] = cv::Point2f(309.35+80-10, 60-20);
+    dst[2] = cv::Point2f(309.35+80-10, 186.19-20-10);
+    dst[3] = cv::Point2f(257+80, 186.19-20-10);
+    cv::Mat M = cv::getPerspectiveTransform(src, dst);
+
+    // HoG person detection
+    cv::HOGDescriptor hog;
+    hog.setSVMDetector(cv::HOGDescriptor::getDefaultPeopleDetector());
+    std::vector<cv::Rect> found;
+
+    cv::Rect focus = cv::Rect(0, 0, 570, 430);
+
+    cv::Mat frame, orth;
+    cv::namedWindow( "Orth", CV_WINDOW_AUTOSIZE );
+
+    while (true)
+    {
+        cap >> frame;
+        if (frame.empty()) break;
+
+        cv::Mat camera = frame(focus);
+        cv::warpPerspective(camera, orth, M, camera.size() );
+
+        hog.detectMultiScale(orth, found);
+
+        for(unsigned i = 0; i < found.size(); i++) {
+            cv::Rect r = found[i];
+            cv::rectangle(orth, r.tl(), r.br(), cv::Scalar(0,255,0), 2);
+        }
+
+        cv::imshow("Orth", orth);
+        cv::imshow("Orig", camera);
+
+        if ((char)cv::waitKey(5)==27) break;
+    }
+    return 0;
+}
+
+int subtractBG(std::string file)
+{
+    cv::VideoCapture cap(file.c_str());
+    if (!cap.isOpened())
+    {
+        std::cout << "Could not open file" << std::endl;
+        return 1;
+    }
+    int width = cap.get(CV_CAP_PROP_FRAME_WIDTH);
+    int height = cap.get(CV_CAP_PROP_FRAME_HEIGHT);
+
+    cv::BackgroundSubtractorMOG2 bg(50, 10, true);
+    std::vector<std::vector<cv::Point> > contours;
+    cv::Mat frame, fore, back;
+
+    while (true)
+    {
+        cap >> frame;
+        cv::imshow("Orig", frame);
+
+        cv::Mat xComp(cv::Size(width, height), CV_32FC1);
+        cv::Mat yComp(cv::Size(width, height), CV_32FC1);
+        cv::Mat orientation = cv::Mat(height, width, CV_8UC1);
+
+        cv::Sobel(frame, xComp, CV_32F, 1, 0);
+        cv::Sobel(frame, yComp, CV_32F, 0, 1);
+
+        for (int y=0; y<height; y++) {
+            const float *xcompRow = xComp.ptr<float>(y);
+            const float *ycompRow = yComp.ptr<float>(y);
+
+            for (int x=0; x<width; x++) {
+                float shiftX = xcompRow[x];
+                float shiftY = ycompRow[x];
+                uchar* p = orientation.ptr<uchar>(y,x);
+                *p = (uchar)(cv::fastAtan2(shiftY, shiftX)/360.0*180);
+                //*(p+1) = 255;
+                //*(p+2) = 255;
+            }
+        }
+        //std::cout << orientation << std::endl;
+
+        bg.operator ()(orientation, fore);
+        //bg.getBackgroundImage(back);
+        cv::erode(fore,fore,cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3,3)));
+        cv::dilate(fore,fore,cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3,3)));
+
+        cv::imshow("Foreground", fore);
+
+        cv::findContours(fore,contours,CV_RETR_EXTERNAL,CV_CHAIN_APPROX_NONE);
+        cv::drawContours(frame,contours,-1,cv::Scalar(0,0,255),2);
+
+        cv::Mat bgrOrientation;
+        cv::cvtColor(orientation, bgrOrientation, CV_GRAY2BGR);
+        cv::imshow("Frame",orientation);
+
+        //cv::Mat bgrBack;
+        //cv::cvtColor(back, bgrBack, CV_HSV2BGR);
+        //cv::imshow("Background",back);
+
+        if(cv::waitKey(3) >= 0) break;
+    }
+
+    return 0;
+}
